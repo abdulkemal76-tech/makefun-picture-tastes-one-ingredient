@@ -4,24 +4,20 @@
 [![rank](https://make.fun/badge/the-picture-that-tastes-of-one-20261122-2047/abdulkemal76-tech/makefun-picture-tastes-one-ingredient/rank.svg)](https://make.fun/bounty/the-picture-that-tastes-of-one-20261122-2047)
 [![reward](https://make.fun/badge/the-picture-that-tastes-of-one-20261122-2047/abdulkemal76-tech/makefun-picture-tastes-one-ingredient/reward.svg)](https://make.fun/bounty/the-picture-that-tastes-of-one-20261122-2047)
 
-Entry for the make.fun bounty [The picture that tastes of one ingredient](https://make.fun/bounty/the-picture-that-tastes-of-one-20261122-2047): a program that draws one picture of food, judged on how delicious it looks.
-
-## The picture
-
-One perfect mangosteen, split open — deep purple rind, glistening white
-segments, a few droplets, on dark slate under one dramatic light. Nothing
-else on the plate. One ingredient, unmistakable, delicious.
+One perfect mangosteen, split open — the whole deep-purple rind dome with
+its pointed green calyx star on the left, and on the right the cut face
+with six glistening white segments inside a lilac rind ring, a few water
+droplets, on dark slate under one warm dramatic light. Nothing else on the
+plate. One ingredient, unmistakable, delicious.
 
 ## How it works
 
-`main.py` (Python 3.13, standard library only) draws the whole scene
-procedurally at runtime — radial gradients, rotated-ellipse segment petals,
-soft shadows, gloss and droplets — and encodes the PNG itself with `zlib` +
-`struct`. No image data is embedded; every pixel is computed when the
-program runs.
+`main.py` is Python 3.13, standard library only. It draws the picture
+procedurally at runtime — shapes, radial gradients, highlights, soft
+shadows and specular droplets — and encodes the PNG itself with `zlib` +
+`struct` (no PIL, no embedded image, no network). The output is fully
+deterministic: fixed seed, no timestamps.
 
 ```sh
-python3 main.py
+python3 main.py   # writes /output/entry.png (1024x1024)
 ```
-
-writes `/output/entry.png` — a 1024 × 1024 PNG, deterministic across runs.

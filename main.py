@@ -1,168 +1,214 @@
 #!/usr/bin/env python3
-"""One mangosteen, split open — procedural renderer (Python stdlib only).
+"""One mangosteen, split open.
 
-Draws a single perfect mangosteen, split into two halves, on dark slate
-under one dramatic light. No image data is embedded; every pixel is
-computed from shapes, gradients and highlights at runtime.
+Draws a single perfect mangosteen -- one half the deep-purple rind dome
+with its green calyx star, the other half the cut face with six glistening
+white segments -- on dark slate under one warm dramatic light.
 
-Output: /output/entry.png — 1024x1024 PNG, deterministic.
+Stdlib only. Everything is drawn procedurally at runtime (shapes, radial
+gradients, highlights, soft shadows, specular droplets) and the PNG is
+encoded by hand with zlib + struct. Deterministic: fixed seed, no clock,
+no network, no file input.
+
+Usage: python3 main.py  ->  writes /output/entry.png (1024x1024)
 """
+
 import math
 import os
+import random
 import struct
 import zlib
 
-W = H = 1024
-OUT = "/output/entry.png"
+W = 1024
+H = 1024
 
+# ---------------------------------------------------------------------------
+# Pixel buffer (RGB, row-major bytearray)
+# ---------------------------------------------------------------------------
 buf = bytearray(W * H * 3)
 
 
-# ---------------------------------------------------------------- helpers
-def _clamp255(v):
-    return 0 if v < 0 else (255 if v > 255 else v)
+def blend_px(x, y, r, g, b, a):
+    """Blend one pixel with coverage a (0..1)."""
+    if 0 <= x < W and 0 <= y < H and a > 0.0:
+        i = (y * W + x) * 3
+        if a >= 1.0:
+            buf[i] = r
+            buf[i + 1] = g
+            buf[i + 2] = b
+        else:
+            ia = 1.0 - a
+            buf[i] = int(buf[i] * ia + r * a + 0.5)
+            buf[i + 1] = int(buf[i + 1] * ia + g * a + 0.5)
+            buf[i + 2] = int(buf[i + 2] * ia + b * a + 0.5)
 
 
-def lerp3(c0, c1, t):
-    return (
-        int(c0[0] + (c1[0] - c0[0]) * t),
-        int(c0[1] + (c1[1] - c0[1]) * t),
-        int(c0[2] + (c1[2] - c0[2]) * t),
-    )
+def lerp(a, b, t):
+    return a + (b - a) * t
 
 
-def grad_table(c0, c1, n=256):
-    return [lerp3(c0, c1, i / (n - 1)) for i in range(n)]
+def clamp01(v):
+    return 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
 
 
-def glow_table(n=256, power=1.6):
-    """0..255 falloff: 255 at centre, 0 at edge."""
-    return [int(255 * (1.0 - i / (n - 1)) ** power) for i in range(n)]
+def smooth(t):
+    t = clamp01(t)
+    return t * t * (3.0 - 2.0 * t)
 
 
-def ellipse_grad_fill(cx, cy, rx, ry, table, hx, hy):
-    """Filled ellipse, radial gradient indexed by squared distance from (hx, hy)."""
-    r2 = max(rx, ry) ** 2
-    inv = 255.0 / r2
-    y0 = max(0, cy - ry)
-    y1 = min(H - 1, cy + ry)
-    for y in range(y0, y1 + 1):
-        ny = (y - cy) / ry
-        rest = 1.0 - ny * ny
-        if rest <= 0:
-            continue
-        dx = int(rx * math.sqrt(rest))
-        x0 = max(0, cx - dx)
-        x1 = min(W - 1, cx + dx)
-        i = (y * W + x0) * 3
-        ddy = y - hy
-        ddy2 = ddy * ddy
-        for x in range(x0, x1 + 1):
-            ddx = x - hx
-            t = int((ddx * ddx + ddy2) * inv)
-            if t > 255:
-                t = 255
-            c = table[t]
-            buf[i] = c[0]
-            buf[i + 1] = c[1]
-            buf[i + 2] = c[2]
-            i += 3
-
-
-def disc_grad(cx, cy, r, table, hx, hy):
-    """Filled disc, radial gradient indexed by squared distance from (hx, hy)."""
+# ---------------------------------------------------------------------------
+# Drawing primitives
+# ---------------------------------------------------------------------------
+def disc(cx, cy, r, color, alpha=1.0):
+    """Solid filled circle."""
+    r0, g0, b0 = color
+    x0 = max(0, int(cx - r))
+    x1 = min(W - 1, int(cx + r) + 1)
+    y0 = max(0, int(cy - r))
+    y1 = min(H - 1, int(cy + r) + 1)
     r2 = r * r
-    inv = 255.0 / r2
-    y0 = max(0, cy - r)
-    y1 = min(H - 1, cy + r)
     for y in range(y0, y1 + 1):
         dy = y - cy
-        rest = r2 - dy * dy
-        if rest < 0:
-            continue
-        dx = int(math.sqrt(rest))
-        x0 = max(0, cx - dx)
-        x1 = min(W - 1, cx + dx)
-        i = (y * W + x0) * 3
-        ddy = y - hy
-        ddy2 = ddy * ddy
-        for x in range(x0, x1 + 1):
-            ddx = x - hx
-            t = int((ddx * ddx + ddy2) * inv)
-            if t > 255:
-                t = 255
-            c = table[t]
-            buf[i] = c[0]
-            buf[i + 1] = c[1]
-            buf[i + 2] = c[2]
-            i += 3
-
-
-def disc_soft(cx, cy, rx, ry, color, a0, a1):
-    """Elliptical soft blob: alpha falls from a0 (centre) to a1 (edge)."""
-    cr, cg, cb = color
-    y0 = max(0, cy - ry)
-    y1 = min(H - 1, cy + ry)
-    for y in range(y0, y1 + 1):
-        ny = (y - cy) / ry
-        rest = 1.0 - ny * ny
-        if rest <= 0:
-            continue
-        dx = int(rx * math.sqrt(rest))
-        x0 = max(0, cx - dx)
-        x1 = min(W - 1, cx + dx)
-        i = (y * W + x0) * 3
-        for x in range(x0, x1 + 1):
-            nx = (x - cx) / rx
-            v = nx * nx + ny * ny
-            if v > 1.0:
-                continue
-            a = a0 + (a1 - a0) * v
-            if a <= 0.003:
-                i += 3
-                continue
-            buf[i] = int(buf[i] + (cr - buf[i]) * a)
-            buf[i + 1] = int(buf[i + 1] + (cg - buf[i + 1]) * a)
-            buf[i + 2] = int(buf[i + 2] + (cb - buf[i + 2]) * a)
-            i += 3
-
-
-def ring_band(cx, cy, r0, r1, color, alpha, ang0=None, ang1=None):
-    """Blend a ring (optionally restricted to an angle range, degrees,
-    0 = east, 90 = north, screen y down)."""
-    cr, cg, cb = color
-    r0sq = r0 * r0
-    r1sq = r1 * r1
-    y0 = max(0, cy - r1)
-    y1 = min(H - 1, cy + r1)
-    for y in range(y0, y1 + 1):
-        dy = y - cy
-        x0 = max(0, cx - r1)
-        x1 = min(W - 1, cx + r1)
-        i = (y * W + x0) * 3
+        dy2 = dy * dy
+        row = y * W * 3
         for x in range(x0, x1 + 1):
             dx = x - cx
-            d2 = dx * dx + dy * dy
-            if d2 < r0sq or d2 > r1sq:
-                i += 3
-                continue
-            if ang0 is not None:
-                ang = math.degrees(math.atan2(-dy, dx)) % 360.0
-                if not (ang0 <= ang <= ang1):
-                    i += 3
-                    continue
-            buf[i] = int(buf[i] + (cr - buf[i]) * alpha)
-            buf[i + 1] = int(buf[i + 1] + (cg - buf[i + 1]) * alpha)
-            buf[i + 2] = int(buf[i + 2] + (cb - buf[i + 2]) * alpha)
-            i += 3
+            if dx * dx + dy2 <= r2:
+                i = row + x * 3
+                if alpha >= 1.0:
+                    buf[i] = r0
+                    buf[i + 1] = g0
+                    buf[i + 2] = b0
+                else:
+                    ia = 1.0 - alpha
+                    buf[i] = int(buf[i] * ia + r0 * alpha + 0.5)
+                    buf[i + 1] = int(buf[i + 1] * ia + g0 * alpha + 0.5)
+                    buf[i + 2] = int(buf[i + 2] * ia + b0 * alpha + 0.5)
 
 
-def fill_poly(points, color):
-    """Scanline fill of a convex polygon."""
-    cr, cg, cb = color
+def radial_disc(cx, cy, r, inner, outer, alpha=1.0, power=1.0, cx2=None, cy2=None,
+                fade=False):
+    """Circle centred on (cx, cy), shaded from `inner` at (cx2, cy2) to
+    `outer` at the rim. With fade=True the alpha also falls to zero at the
+    rim, so overlays (glow, shadow, vignette) leave no hard circular edge.
+    Containment is always the circle around (cx, cy); only the shading
+    centre is offset -- the two must never be confused."""
+    if cx2 is None:
+        cx2, cy2 = cx, cy
+    ir, ig, ib = inner
+    orr, og, ob = outer
+    x0 = max(0, int(cx - r))
+    x1 = min(W - 1, int(cx + r) + 1)
+    y0 = max(0, int(cy - r))
+    y1 = min(H - 1, int(cy + r) + 1)
+    r2 = r * r
+    for y in range(y0, y1 + 1):
+        dy = y - cy
+        dy2 = dy * dy
+        dys = y - cy2
+        row = y * W * 3
+        for x in range(x0, x1 + 1):
+            dx = x - cx
+            d2 = dx * dx + dy2
+            if d2 <= r2:
+                dxs = x - cx2
+                ds2 = dxs * dxs + dys * dys
+                t = math.sqrt(ds2) / r
+                if t > 1.0:
+                    t = 1.0
+                t = t ** power
+                rr = int(lerp(ir, orr, t) + 0.5)
+                gg = int(lerp(ig, og, t) + 0.5)
+                bb = int(lerp(ib, ob, t) + 0.5)
+                a = alpha
+                if fade:
+                    tg = math.sqrt(d2) / r
+                    a = alpha * (1.0 - tg)
+                    if a <= 0.0:
+                        continue
+                i = row + x * 3
+                if a >= 1.0:
+                    buf[i] = rr
+                    buf[i + 1] = gg
+                    buf[i + 2] = bb
+                else:
+                    ia = 1.0 - a
+                    buf[i] = int(buf[i] * ia + rr * a + 0.5)
+                    buf[i + 1] = int(buf[i + 1] * ia + gg * a + 0.5)
+                    buf[i + 2] = int(buf[i + 2] * ia + bb * a + 0.5)
+
+
+def ellipse(cx, cy, rx, ry, color, alpha=1.0):
+    """Solid filled ellipse."""
+    r0, g0, b0 = color
+    x0 = max(0, int(cx - rx))
+    x1 = min(W - 1, int(cx + rx) + 1)
+    y0 = max(0, int(cy - ry))
+    y1 = min(H - 1, int(cy + ry) + 1)
+    for y in range(y0, y1 + 1):
+        dy = (y - cy) / ry
+        dy2 = dy * dy
+        if dy2 > 1.0:
+            continue
+        half = rx * math.sqrt(1.0 - dy2)
+        xa = max(x0, int(cx - half))
+        xb = min(x1, int(cx + half))
+        row = y * W * 3
+        for x in range(xa, xb + 1):
+            i = row + x * 3
+            if alpha >= 1.0:
+                buf[i] = r0
+                buf[i + 1] = g0
+                buf[i + 2] = b0
+            else:
+                ia = 1.0 - alpha
+                buf[i] = int(buf[i] * ia + r0 * alpha + 0.5)
+                buf[i + 1] = int(buf[i + 1] * ia + g0 * alpha + 0.5)
+                buf[i + 2] = int(buf[i + 2] * ia + b0 * alpha + 0.5)
+
+
+def radial_ellipse(cx, cy, rx, ry, inner, outer, alpha=1.0, power=1.0):
+    """Ellipse shaded from `inner` at its centre to `outer` at the rim."""
+    ir, ig, ib = inner
+    orr, og, ob = outer
+    x0 = max(0, int(cx - rx))
+    x1 = min(W - 1, int(cx + rx) + 1)
+    y0 = max(0, int(cy - ry))
+    y1 = min(H - 1, int(cy + ry) + 1)
+    for y in range(y0, y1 + 1):
+        dy = (y - cy) / ry
+        dy2 = dy * dy
+        if dy2 > 1.0:
+            continue
+        half = rx * math.sqrt(1.0 - dy2)
+        xa = max(x0, int(cx - half))
+        xb = min(x1, int(cx + half))
+        row = y * W * 3
+        for x in range(xa, xb + 1):
+            dx = (x - cx) / rx
+            d = math.sqrt(dx * dx + dy2)
+            t = d ** power
+            rr = int(lerp(ir, orr, t) + 0.5)
+            gg = int(lerp(ig, og, t) + 0.5)
+            bb = int(lerp(ib, ob, t) + 0.5)
+            i = row + x * 3
+            if alpha >= 1.0:
+                buf[i] = rr
+                buf[i + 1] = gg
+                buf[i + 2] = bb
+            else:
+                ia = 1.0 - alpha
+                buf[i] = int(buf[i] * ia + rr * alpha + 0.5)
+                buf[i + 1] = int(buf[i + 1] * ia + gg * alpha + 0.5)
+                buf[i + 2] = int(buf[i + 2] * ia + bb * alpha + 0.5)
+
+
+def poly(points, color, alpha=1.0):
+    """Filled polygon (scanline fill)."""
+    r0, g0, b0 = color
     ys = [p[1] for p in points]
     y0 = max(0, int(min(ys)))
-    y1 = min(H - 1, int(max(ys)))
+    y1 = min(H - 1, int(max(ys)) + 1)
     n = len(points)
     for y in range(y0, y1 + 1):
         xs = []
@@ -174,290 +220,351 @@ def fill_poly(points, color):
                 xs.append(x1 + t * (x2 - x1))
         if len(xs) < 2:
             continue
-        xa, xb = int(min(xs)), int(max(xs))
-        xa = max(0, xa)
-        xb = min(W - 1, xb)
-        i = (y * W + xa) * 3
-        for _ in range(xa, xb + 1):
-            buf[i] = cr
-            buf[i + 1] = cg
-            buf[i + 2] = cb
-            i += 3
+        xs.sort()
+        for j in range(0, len(xs) - 1, 2):
+            xa = max(0, int(xs[j]))
+            xb = min(W - 1, int(xs[j + 1]))
+            row = y * W * 3
+            for x in range(xa, xb + 1):
+                i = row + x * 3
+                if alpha >= 1.0:
+                    buf[i] = r0
+                    buf[i + 1] = g0
+                    buf[i + 2] = b0
+                else:
+                    ia = 1.0 - alpha
+                    buf[i] = int(buf[i] * ia + r0 * alpha + 0.5)
+                    buf[i + 1] = int(buf[i + 1] * ia + g0 * alpha + 0.5)
+                    buf[i + 2] = int(buf[i + 2] * ia + b0 * alpha + 0.5)
 
 
-def ellipse_grad(cx, cy, a, b, ang_deg, c_top, c_bot, c_edge):
-    """Rotated ellipse petal: vertical gradient + darker rim near edge."""
-    ang = math.radians(-ang_deg)
+def thick_line(x1, y1, x2, y2, w, color, alpha=1.0):
+    """A tapered line drawn as a thin quad."""
+    dx = x2 - x1
+    dy = y2 - y1
+    ln = math.hypot(dx, dy) or 1.0
+    nx = -dy / ln * w / 2.0
+    ny = dx / ln * w / 2.0
+    poly([(x1 + nx, y1 + ny), (x2 + nx, y2 + ny),
+          (x2 - nx, y2 - ny), (x1 - nx, y1 - ny)], color, alpha)
+
+
+def rotated_ellipse(cx, cy, a, b, ang, inner, outer, alpha=1.0, power=1.0,
+                    sector=None):
+    """Ellipse rotated by `ang` radians, centre-shaded inner -> outer.
+    With sector=(sx, sy, sang, half) only pixels whose angle from (sx, sy)
+    lies within half radians of sang are painted -- used to clip each
+    mangosteen segment to its own 60-degree wedge so neighbouring lobes
+    meet cleanly instead of overlapping into a pinwheel."""
+    ir, ig, ib = inner
+    orr, og, ob = outer
     ca = math.cos(ang)
     sa = math.sin(ang)
-    y0 = max(0, int(cy - max(a, b) - 2))
-    y1 = min(H - 1, int(cy + max(a, b) + 2))
-    x0 = max(0, int(cx - max(a, b) - 2))
-    x1 = min(W - 1, int(cx + max(a, b) + 2))
-    ia = 1.0 / a
-    ib = 1.0 / b
+    ext = max(a, b)
+    x0 = max(0, int(cx - ext))
+    x1 = min(W - 1, int(cx + ext) + 1)
+    y0 = max(0, int(cy - ext))
+    y1 = min(H - 1, int(cy + ext) + 1)
+    if sector is not None:
+        scx, scy, sang, half = sector
     for y in range(y0, y1 + 1):
         dy = y - cy
-        i = (y * W + x0) * 3
+        row = y * W * 3
         for x in range(x0, x1 + 1):
             dx = x - cx
-            rx = dx * ca - dy * sa
-            ry = dx * sa + dy * ca
-            u = rx * ia
-            v = ry * ib
-            q = u * u + v * v
-            if q > 1.0:
-                i += 3
-                continue
-            # vertical shading: top lighter, bottom warmer/darker
-            t = 0.5 + 0.5 * v
-            r = int(c_top[0] + (c_bot[0] - c_top[0]) * t)
-            g = int(c_top[1] + (c_bot[1] - c_top[1]) * t)
-            bl = int(c_top[2] + (c_bot[2] - c_top[2]) * t)
-            # darken toward the rim (stronger: segments must read individually)
-            edge = q * q * 0.55
-            r = int(r + (c_edge[0] - r) * edge)
-            g = int(g + (c_edge[1] - g) * edge)
-            bl = int(bl + (c_edge[2] - bl) * edge)
+            u = (dx * ca + dy * sa) / a
+            v = (-dx * sa + dy * ca) / b
+            d2 = u * u + v * v
+            if d2 <= 1.0:
+                if sector is not None:
+                    pa = math.atan2(y - scy, x - scx) - sang
+                    while pa > math.pi:
+                        pa -= 2 * math.pi
+                    while pa < -math.pi:
+                        pa += 2 * math.pi
+                    if abs(pa) > half:
+                        continue
+                t = math.sqrt(d2) ** power
+                rr = int(lerp(ir, orr, t) + 0.5)
+                gg = int(lerp(ig, og, t) + 0.5)
+                bb = int(lerp(ib, ob, t) + 0.5)
+                i = row + x * 3
+                if alpha >= 1.0:
+                    buf[i] = rr
+                    buf[i + 1] = gg
+                    buf[i + 2] = bb
+                else:
+                    ia = 1.0 - alpha
+                    buf[i] = int(buf[i] * ia + rr * alpha + 0.5)
+                    buf[i + 1] = int(buf[i + 1] * ia + gg * alpha + 0.5)
+                    buf[i + 2] = int(buf[i + 2] * ia + bb * alpha + 0.5)
+
+
+# ---------------------------------------------------------------------------
+# Scene
+# ---------------------------------------------------------------------------
+rng = random.Random(20261123)
+
+# Warm key light comes from the upper left.
+LX, LY = -0.55, -0.75  # light direction (unit-ish)
+
+
+def background():
+    # Vertical charcoal gradient, slightly warmer toward the middle.
+    top = (16, 16, 21)
+    mid = (44, 38, 34)
+    bot = (13, 13, 17)
+    for y in range(H):
+        t = y / (H - 1)
+        if t < 0.45:
+            k = t / 0.45
+            r = int(lerp(top[0], mid[0], k) + 0.5)
+            g = int(lerp(top[1], mid[1], k) + 0.5)
+            b = int(lerp(top[2], mid[2], k) + 0.5)
+        else:
+            k = (t - 0.45) / 0.55
+            r = int(lerp(mid[0], bot[0], k) + 0.5)
+            g = int(lerp(mid[1], bot[1], k) + 0.5)
+            b = int(lerp(mid[2], bot[2], k) + 0.5)
+        row = y * W * 3
+        for x in range(W):
+            i = row + x * 3
             buf[i] = r
             buf[i + 1] = g
-            buf[i + 2] = bl
-            i += 3
+            buf[i + 2] = b
+    # Warm glow behind the fruit, centred upper-middle (faded at the rim
+    # so no circular edge shows against the wall).
+    radial_disc(560, 350, 520, (96, 74, 52), (16, 16, 21), alpha=0.55,
+                power=1.6, fade=True)
+
+
+def slate():
+    # Dark slate plane the fruit rests on.
+    for y in range(748, H):
+        t = (y - 748) / (H - 748)
+        r = int(lerp(38, 18, t) + 0.5)
+        g = int(lerp(41, 20, t) + 0.5)
+        b = int(lerp(48, 24, t) + 0.5)
+        row = y * W * 3
+        for x in range(W):
+            i = row + x * 3
+            buf[i] = r
+            buf[i + 1] = g
+            buf[i + 2] = b
+    # Horizon line where the wall meets the slate.
+    thick_line(0, 748, W, 748, 2, (70, 74, 86), 0.35)
+    # Warm pool of light on the slate under the fruit.
+    radial_ellipse(512, 830, 430, 105, (96, 80, 62), (30, 32, 40),
+                   alpha=0.5, power=1.4)
+    # Cool sheen streak across the slate.
+    radial_ellipse(700, 900, 300, 42, (64, 70, 86), (22, 24, 30),
+                   alpha=0.35, power=1.6)
+
+
+def contact_shadow(cx, cy, rx, ry, strength=0.45):
+    # Layered soft shadow: three ellipses, darkest in the middle.
+    for s, a in ((1.15, 0.18), (1.0, 0.30), (0.82, 0.42)):
+        ellipse(cx, cy, rx * s, ry * s, (0, 0, 0), strength * a / 0.42)
 
 
 def droplet(cx, cy, r):
-    """A bright water droplet: pale body, bright specular dot, dark base."""
-    # body: pale blue-white, semi-transparent look via soft alpha
-    disc_soft(cx, cy, r, r, (205, 228, 245), 0.72, 0.18)
-    # lower shade
-    disc_soft(cx, cy + r // 3, int(r * 0.7), int(r * 0.55),
-              (90, 120, 150), 0.28, 0.0)
-    # specular highlight
-    disc_soft(cx - r // 3, cy - r // 3, max(2, r // 3), max(2, r // 3),
-              (255, 255, 255), 0.95, 0.0)
-    # thin bright rim on the upper-left arc
-    ring_band(cx, cy, int(r * 0.78), r, (255, 255, 255), 0.35, 80, 190)
+    """A glistening water droplet: bright core, pale rim, hot highlight."""
+    radial_disc(cx, cy, r, (235, 245, 255), (120, 150, 185),
+                alpha=0.85, power=0.7)
+    disc(cx, cy, r * 0.92, (200, 220, 240), 0.25)
+    disc(cx - r * 0.32, cy - r * 0.36, r * 0.30, (255, 255, 255), 0.95)
+    disc(cx + r * 0.28, cy + r * 0.30, r * 0.14, (255, 255, 255), 0.5)
 
 
-# ---------------------------------------------------------------- scene
-def draw_background():
-    top = (11, 13, 20)
-    bottom = (26, 28, 38)
-    glow = glow_table()
-    # spotlight centre and radius
-    sx, sy, sr = 512, 360, 600
-    inv = 255.0 / (sr * sr)
-    warm = (232, 214, 176)
-    for y in range(H):
-        t = y / (H - 1)
-        br = int(top[0] + (bottom[0] - top[0]) * t)
-        bg = int(top[1] + (bottom[1] - top[1]) * t)
-        bb = int(top[2] + (bottom[2] - top[2]) * t)
-        dy = y - sy
-        dy2 = dy * dy
-        i = (y * W) * 3
-        for x in range(W):
-            dx = x - sx
-            g = int((dx * dx + dy2) * inv)
-            if g > 255:
-                g = 255
-            gl = glow[g]
-            if gl:
-                f = gl / 255.0 * 0.42
-                buf[i] = int(br + (warm[0] - br) * f)
-                buf[i + 1] = int(bg + (warm[1] - bg) * f)
-                buf[i + 2] = int(bb + (warm[2] - bb) * f)
-            else:
-                buf[i] = br
-                buf[i + 1] = bg
-                buf[i + 2] = bb
-            i += 3
+def calyx(cx, cy):
+    """The pointed green star on top of the rind dome."""
+    # Five pointed leaves radiating upward.
+    for k in range(5):
+        ang = math.radians(-90 + (k - 2) * 26)
+        tipx = cx + math.cos(ang) * 58
+        tipy = cy + math.sin(ang) * 58
+        px = math.cos(ang + math.pi / 2)
+        py = math.sin(ang + math.pi / 2)
+        base = 15
+        poly([(cx + px * base, cy + py * base),
+              (tipx, tipy),
+              (cx - px * base, cy - py * base)], (74, 122, 44))
+        # Lighter inner vein on each leaf.
+        tipx2 = cx + math.cos(ang) * 44
+        tipy2 = cy + math.sin(ang) * 44
+        poly([(cx + px * 6, cy + py * 6),
+              (tipx2, tipy2),
+              (cx - px * 6, cy - py * 6)], (122, 170, 80), 0.85)
+    # Short woody stem.
+    poly([(cx - 7, cy - 26), (cx + 7, cy - 26),
+          (cx + 5, cy + 2), (cx - 5, cy + 2)], (88, 66, 38))
+    disc(cx, cy, 11, (58, 96, 36))
+    disc(cx - 3, cy - 3, 4, (140, 185, 95), 0.9)
 
 
-def draw_slate():
-    # a low tabletop plane: only the top of a wide ellipse shows,
-    # so it reads as a surface with a horizon, not a floating disc
-    ellipse_grad_fill(512, 1030, 600, 280,
-                      grad_table((52, 55, 68), (18, 20, 28)),
-                      512, 800)
-    # subtle sheen where the light pools on the slate
-    disc_soft(512, 800, 330, 70, (130, 140, 160), 0.10, 0.0)
+def rind_dome(cx, cy, r):
+    """Left half: the deep-purple rind dome, lit from the upper left."""
+    # Base sphere shading, highlight offset toward the light.
+    radial_disc(cx, cy, r, (150, 66, 168), (46, 14, 58),
+                alpha=1.0, power=1.15, cx2=cx - 62, cy2=cy - 78)
+    # Deep shadow creeping in from the lower right (faded at the rim).
+    radial_disc(cx + 78, cy + 88, r * 0.85, (20, 6, 28), (46, 14, 58),
+                alpha=0.55, power=1.4, fade=True)
+    # Hot specular bloom upper left.
+    radial_ellipse(cx - 96, cy - 104, 78, 46, (214, 158, 224), (150, 66, 168),
+                   alpha=0.55, power=1.2)
+    # Pale rim light along the upper-left edge (dense small dots so the
+    # arc reads as a smooth highlight, not a beaded outline).
+    for k in range(120):
+        a = math.radians(150 + k * 1.0)
+        px = cx + math.cos(a) * (r - 4)
+        py = cy + math.sin(a) * (r - 4)
+        disc(px, py, 4, (196, 150, 208), 0.16)
+    # Rind speckle: tiny darker pores, deterministic.
+    for _ in range(110):
+        a = rng.uniform(0, 2 * math.pi)
+        d = math.sqrt(rng.uniform(0, 1)) * (r - 14)
+        px = cx + math.cos(a) * d
+        py = cy + math.sin(a) * d
+        rad = rng.uniform(1.0, 3.2)
+        disc(px, py, rad, (30, 8, 40), rng.uniform(0.10, 0.28))
+    # A few pale freckles catching the light.
+    for _ in range(18):
+        a = rng.uniform(0, 2 * math.pi)
+        d = math.sqrt(rng.uniform(0, 1)) * (r - 20)
+        px = cx + math.cos(a) * d
+        py = cy + math.sin(a) * d
+        disc(px, py, rng.uniform(0.8, 1.8), (210, 170, 215), 0.30)
+    # Thin darker outline to seat the dome on the background.
+    for k in range(240):
+        a = k / 240.0 * 2 * math.pi
+        px = cx + math.cos(a) * (r - 1)
+        py = cy + math.sin(a) * (r - 1)
+        disc(px, py, 2, (24, 8, 32), 0.5)
 
 
-def draw_rind_half(cx, cy, r):
-    """Left half: the outer purple rind dome, with calyx on top."""
-    # dark outer rim
-    disc_grad(cx, cy, r, grad_table((58, 22, 66), (38, 14, 44)), cx - 40, cy - 60)
-    # main body gradient: light from upper-left, deeper moodier purple
-    disc_grad(cx, cy, r - 6,
-              grad_table((128, 62, 138), (44, 16, 52)),
-              cx - 70, cy - 80)
-    # deep shadow toward lower-right
-    disc_soft(cx + 70, cy + 80, r // 2, r // 2, (20, 6, 26), 0.38, 0.0)
-    # glossy highlight upper-left: tighter, crescent-like (not a smudge)
-    disc_soft(cx - 95, cy - 105, 58, 30, (198, 142, 208), 0.16, 0.0)
-    disc_soft(cx - 110, cy - 120, 34, 20, (228, 192, 232), 0.26, 0.0)
-    # bright rim light along the top-left edge
-    ring_band(cx, cy, r - 9, r - 2, (196, 140, 205), 0.55, 75, 185)
-    # faint rim light lower-right (bounce)
-    ring_band(cx, cy, r - 7, r - 2, (120, 70, 130), 0.25, 285, 345)
-    # deterministic mottling: tiny darker speckles on the rind
-    seed = 1234567
-    for _ in range(46):
-        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        ang = (seed % 360) * math.pi / 180.0
-        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        rr = (seed % 82 + 8) / 100.0 * (r - 18)
-        px = int(cx + math.cos(ang) * rr)
-        py = int(cy + math.sin(ang) * rr * 0.92)
-        pr = 2 + (seed % 4)
-        disc_soft(px, py, pr, pr, (30, 10, 36), 0.30, 0.0)
-    # calyx: four pointed leaves in a star + short stem (classic mangosteen top)
-    cal_y = cy - r + 6
-    disc_soft(cx, cal_y - 24, 12, 30, (58, 92, 40), 0.9, 0.0)  # stem base
-    for k, ang_deg in enumerate((-58, -20, 20, 58)):
-        a = math.radians(ang_deg)
-        tipx = cx + int(math.sin(a) * 52)
-        tipy = cal_y - 6 - int(math.cos(a) * 44)
-        # leaf as a pointed triangle, base straddling the centre
-        px = math.cos(a)
-        py = -math.sin(a)
-        bx, by = cx, cal_y - 4
-        leaf = (110, 158, 76) if k % 2 == 0 else (88, 136, 60)
-        fill_poly([
-            (tipx, tipy),
-            (int(bx + px * 13 - py * 0 + math.sin(a) * 0), int(by + py * 13)),
-            (int(bx - px * 13), int(by - py * 13)),
-        ], leaf)
-    disc_grad(cx, cal_y - 4, 11, grad_table((96, 140, 66), (52, 84, 36)),
-              cx, cal_y - 8)
+def cut_face(cx, cy, r):
+    """Right half: the cut face -- lilac rind ring, six white segments."""
+    # Outer rind ring (dark purple) and lilac inner ring.
+    disc(cx, cy, r, (58, 20, 72))
+    radial_disc(cx, cy, r - 8, (132, 74, 150), (74, 30, 88),
+                alpha=1.0, power=1.3, cx2=cx - 40, cy2=cy - 52)
+    disc(cx, cy, r - 30, (176, 138, 186))          # lilac ring
+    disc(cx, cy, r - 44, (196, 162, 204), 0.6)     # lilac inner glow
+    # Cream flesh bed.
+    radial_disc(cx, cy, r - 52, (252, 240, 224), (226, 204, 182),
+                alpha=1.0, power=1.1, cx2=cx - 30, cy2=cy - 40)
 
+    # Six plump segments, each a rotated lobe clipped to its own 60-degree
+    # wedge, brightest toward the light. The lobes are big enough to touch
+    # each other and the lilac ring, so the flesh reads as one juicy cut
+    # face; the wedge clip keeps them meeting cleanly at the centre like
+    # real segments instead of overlapping into a pinwheel.
+    for k in range(6):
+        ang = math.radians(-90 + k * 60)
+        scx = cx + math.cos(ang) * 76
+        scy = cy + math.sin(ang) * 76
+        sector = (cx, cy, ang, math.radians(30))
+        # Hairline rim: only 3px larger and barely darker than the flesh.
+        rotated_ellipse(scx, scy, 91, 71, ang + math.pi / 2,
+                        (228, 208, 188), (222, 200, 178), alpha=1.0,
+                        sector=sector)
+        # The glistening segment itself.
+        rotated_ellipse(scx, scy, 88, 68, ang + math.pi / 2,
+                        (255, 252, 246), (234, 214, 190),
+                        alpha=1.0, power=0.85, sector=sector)
+        # Wet sheen: bright wash toward the upper-left of the lobe.
+        radial_disc(scx - 18, scy - 20, 40, (255, 255, 255), (255, 252, 246),
+                    alpha=0.45, power=1.2, fade=True)
+        # Specular sparkle.
+        disc(scx - 26, scy - 26, 5, (255, 255, 255), 0.85)
+        disc(scx + 20, scy + 12, 3, (255, 255, 255), 0.6)
 
-def draw_flesh_half(cx, cy, r):
-    """Right half: the cut face — white segments inside a purple rind ring."""
-    # contact shadow cast onto the rind half (drawn before this disc)
-    disc_soft(cx - 150, cy + 10, r, r, (10, 6, 12), 0.30, 0.0)
-    # rind ring
-    disc_grad(cx, cy, r, grad_table((140, 76, 148), (50, 20, 58)),
-              cx - 70, cy - 80)
-    ring_band(cx, cy, r - 8, r - 2, (190, 132, 198), 0.45, 60, 170)
-    # cut-edge ring: paler lilac-pink where the rind was sliced
-    disc_grad(cx, cy, r - 14, grad_table((168, 108, 158), (120, 66, 116)),
-              cx - 40, cy - 50)
-    # white flesh base
-    flesh_r = r - 34
-    disc_grad(cx, cy, flesh_r,
-              grad_table((255, 250, 242), (238, 222, 200)),
-              cx - 30, cy - 40)
-    # six segments as glossy petals
-    n_seg = 6
-    for k in range(n_seg):
-        ang = -90 + k * (360.0 / n_seg)
-        a = math.radians(ang)
-        pcx = cx + int(math.cos(a) * flesh_r * 0.48)
-        pcy = cy + int(math.sin(a) * flesh_r * 0.48)
-        ellipse_grad(pcx, pcy, int(flesh_r * 0.66), int(flesh_r * 0.38),
-                     ang + 90,
-                     (255, 253, 247), (240, 224, 200), (196, 168, 138))
-    # faint pink blush just inside the flesh edge
-    ring_band(cx, cy, flesh_r - 16, flesh_r - 2, (232, 198, 186), 0.16)
-    # separators: thin pale lines radiating between segments
-    for k in range(n_seg):
-        ang = -90 + (k + 0.5) * (360.0 / n_seg)
-        a = math.radians(ang)
-        ex = cx + int(math.cos(a) * (flesh_r - 4))
-        ey = cy + int(math.sin(a) * (flesh_r - 4))
-        # wedge: two offset lines meeting near the centre
-        px = math.cos(a + math.pi / 2)
-        py = math.sin(a + math.pi / 2)
-        fill_poly([
-            (cx + int(px * 6), cy + int(py * 6)),
-            (cx - int(px * 6), cy - int(py * 6)),
-            (ex - int(px * 3), ey - int(py * 3)),
-            (ex + int(px * 3), ey + int(py * 3)),
-        ], (196, 170, 140))
-    # centre core where segments meet
-    disc_grad(cx, cy, 20, grad_table((250, 238, 222), (226, 204, 182)),
-              cx - 4, cy - 5)
-    disc_soft(cx, cy, 7, 7, (196, 168, 142), 0.5, 0.0)
-    # gloss: soft light sweeping the upper segments
-    disc_soft(cx - 55, cy - 75, 110, 60, (255, 255, 255), 0.22, 0.0)
-    disc_soft(cx + 70, cy - 40, 60, 34, (255, 255, 255), 0.14, 0.0)
-    # specular sparkles on the flesh
-    for sx, sy, sr in ((cx - 88, cy - 62, 7), (cx + 30, cy - 96, 5),
-                       (cx + 96, cy + 18, 6), (cx - 20, cy + 88, 5)):
-        disc_soft(sx, sy, sr, sr, (255, 255, 255), 0.85, 0.0)
+    # Creases between segments: short, soft, and low-contrast -- they
+    # separate the lobes without drawing a diagram over the flesh.
+    for k in range(6):
+        ang = math.radians(-60 + k * 60)
+        x1 = cx + math.cos(ang) * 34
+        y1 = cy + math.sin(ang) * 34
+        x2 = cx + math.cos(ang) * (r - 100)
+        y2 = cy + math.sin(ang) * (r - 100)
+        thick_line(x1, y1, x2, y2, 5, (204, 176, 146), 0.45)
+        thick_line(x1, y1, x2, y2, 2, (188, 156, 124), 0.4)
 
+    # Central hub: the pale core the segments grow from.
+    radial_disc(cx, cy, 30, (255, 250, 240), (224, 200, 176),
+                alpha=1.0, power=1.0)
+    disc(cx - 7, cy - 8, 7, (255, 255, 255), 0.8)
 
-def draw_droplets():
-    # on the rind
-    droplet(268, 428, 10)
-    droplet(392, 318, 8)
-    droplet(452, 668, 9)
-    # on the white flesh
-    droplet(668, 428, 9)
-    droplet(742, 560, 7)
-    # on the slate beside the fruit (must sit below the slate horizon ~y800)
-    droplet(845, 862, 8)
-    droplet(205, 868, 7)
+    # Rim light on the upper-left of the rind ring (dense, smooth).
+    for k in range(100):
+        a = math.radians(150 + k * 1.0)
+        px = cx + math.cos(a) * (r - 5)
+        py = cy + math.sin(a) * (r - 5)
+        disc(px, py, 4, (206, 158, 216), 0.18)
 
 
 def vignette():
-    table = [int(255 * (1.0 - 0.42 * (i / 255.0) ** 1.7)) for i in range(256)]
-    maxd2 = 512 * 512 + 512 * 512
-    inv = 255.0 / maxd2
-    for y in range(H):
-        dy = y - 512
-        dy2 = dy * dy
-        i = (y * W) * 3
-        for x in range(W):
-            dx = x - 512
-            t = int((dx * dx + dy2) * inv)
-            f = table[t]
-            if f != 255:
-                buf[i] = (buf[i] * f) >> 8
-                buf[i + 1] = (buf[i + 1] * f) >> 8
-                buf[i + 2] = (buf[i + 2] * f) >> 8
-            i += 3
+    # Darken the four corners so the eye stays on the fruit. Each disc
+    # fades to zero alpha at its rim, so no circular edge shows.
+    for ccx, ccy in ((0, 0), (W, 0), (0, H), (W, H)):
+        for rr, aa in ((560, 0.10), (460, 0.16), (360, 0.20), (260, 0.22)):
+            radial_disc(ccx, ccy, rr, (0, 0, 0), (0, 0, 0),
+                        alpha=aa, power=1.0, fade=True)
 
 
-def render():
-    draw_background()
-    draw_slate()
-    # soft shadow pooling under the fruit
-    disc_soft(512, 838, 360, 70, (0, 0, 0), 0.55, 0.0)
-    draw_rind_half(330, 520, 232)
-    draw_flesh_half(700, 520, 232)
-    draw_droplets()
+def draw():
+    background()
+    slate()
+    # Shadows first so the fruit sits in them.
+    contact_shadow(330, 742, 200, 30)
+    contact_shadow(700, 742, 205, 30)
+    # Left: whole rind dome with calyx.
+    rind_dome(330, 512, 212)
+    calyx(330, 296)
+    # Right: cut face.
+    cut_face(700, 512, 218)
+    # Droplets: on the rind, on the cut flesh, on the slate.
+    droplet(398, 372, 11)
+    droplet(262, 470, 8)
+    droplet(428, 648, 9)
+    droplet(664, 470, 8)
+    droplet(742, 586, 7)
+    droplet(196, 884, 9)
+    droplet(838, 876, 8)
     vignette()
 
 
-# ---------------------------------------------------------------- PNG out
+# ---------------------------------------------------------------------------
+# PNG encoder (stdlib only)
+# ---------------------------------------------------------------------------
+def _chunk(typ, data):
+    out = struct.pack(">I", len(data)) + typ + data
+    out += struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF)
+    return out
+
+
 def write_png(path):
+    ihdr = struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)
     raw = bytearray()
     for y in range(H):
-        raw.append(0)
+        raw.append(0)  # filter: none
         raw += buf[y * W * 3:(y + 1) * W * 3]
-    comp = zlib.compress(bytes(raw), 6)
-
-    def chunk(typ, data):
-        out = struct.pack(">I", len(data)) + typ + data
-        out += struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF)
-        return out
-
-    ihdr = struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)
-    data = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
-            + chunk(b"IDAT", comp) + chunk(b"IEND", b""))
+    idat = zlib.compress(bytes(raw), 9)
+    png = b"\x89PNG\r\n\x1a\n"
+    png += _chunk(b"IHDR", ihdr)
+    png += _chunk(b"IDAT", idat)
+    png += _chunk(b"IEND", b"")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as f:
-        f.write(data)
-    return len(data)
+        f.write(png)
+    return len(png)
 
 
 def main():
-    os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    render()
-    n = write_png(OUT)
-    print(f"wrote {OUT}: {W}x{H}, {n} bytes")
+    draw()
+    size = write_png("/output/entry.png")
+    print("wrote /output/entry.png: %dx%d, %d bytes" % (W, H, size))
 
 
 if __name__ == "__main__":
